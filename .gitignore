@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+.venv-yolo/
+
+# YOLO runtime artifacts (model weights are tracked under yolo/models/)
+yolo/wheels/
+yolo/preview.jpg
+
+# Local IDE
+.cursor/

@@ -1,0 +1,14 @@
+[project]
+name = "navengine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10.12"
+dependencies = [
+    "pyserial>=3.5",
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

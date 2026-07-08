@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -20,19 +21,191 @@ from pathlib import Path
 import cv2 as cv
 import numpy as np
 
-from follow_line import (
-    DEFAULT_BAUD,
-    DEFAULT_CAMERA,
-    DEFAULT_PORT,
-    NavLink,
-    ensure_display,
-    open_camera,
+_SRC = Path(__file__).resolve().parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+import serial
+
+from ui_ctrl.constants import CmdCtrl
+from ui_ctrl.protocol import build_ctrl, verify_frame
+from ui_ctrl.training_ctrl import (
+    ROBOT_KEY,
+    TrainingProgram,
+    build_training_init,
+    build_training_start,
+    build_training_stop,
 )
+
 from yolo import DEFAULT_MODEL
 from yolo.scene import ScenePrediction, select_scene_label
 from yolo.viz import overlay_scene
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+# ── 串口/摄像头默认参数（原 follow_line.py）─────────────────────────────
+DEFAULT_PORT = "/dev/ttyCH341USB0"
+DEFAULT_BAUD = 921600
+DEFAULT_CAMERA = 0
+# 手动曝光：AUTO_EXPOSURE=1 后 EXPOSURE/GAIN 生效；AUTO_WB=0 后 WB_TEMPERATURE 生效
+DEFAULT_EXPOSURE = 500
+DEFAULT_GAIN = 60
+DEFAULT_WB_TEMP = 4800
+
+
+@dataclass(frozen=True)
+class CameraSettings:
+    """固定摄像头成像参数，避免巡线时 HSV 因自动曝光/白平衡漂移。"""
+
+    lock: bool = True
+    exposure: float = DEFAULT_EXPOSURE
+    gain: float = DEFAULT_GAIN
+    wb_temperature: float = DEFAULT_WB_TEMP
+    brightness: float | None = None
+    contrast: float | None = None
+    saturation: float | None = None
+
+
+def configure_camera(cap: cv.VideoCapture, settings: CameraSettings) -> None:
+    """锁定曝光与白平衡。本机 USB Camera 经 V4L2/OpenCV 实测可用。"""
+    if not settings.lock:
+        return
+
+    cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 1)
+    cap.set(cv.CAP_PROP_EXPOSURE, settings.exposure)
+    cap.set(cv.CAP_PROP_GAIN, settings.gain)
+
+    cap.set(cv.CAP_PROP_AUTO_WB, 0)
+    cap.set(cv.CAP_PROP_WB_TEMPERATURE, settings.wb_temperature)
+
+    for prop, value in (
+        (cv.CAP_PROP_BRIGHTNESS, settings.brightness),
+        (cv.CAP_PROP_CONTRAST, settings.contrast),
+        (cv.CAP_PROP_SATURATION, settings.saturation),
+    ):
+        if value is not None:
+            cap.set(prop, value)
+
+    # 丢弃前几帧，等驱动应用参数。
+    for _ in range(3):
+        cap.read()
+
+    ae = cap.get(cv.CAP_PROP_AUTO_EXPOSURE)
+    exp = cap.get(cv.CAP_PROP_EXPOSURE)
+    gain = cap.get(cv.CAP_PROP_GAIN)
+    awb = cap.get(cv.CAP_PROP_AUTO_WB)
+    wb = cap.get(cv.CAP_PROP_WB_TEMPERATURE)
+    print(
+        f"摄像头固定参数: 手动曝光 ae={ae:.0f} exp={exp:.0f} gain={gain:.0f} | "
+        f"固定白平衡 awb={awb:.0f} temp={wb:.0f}K"
+    )
+
+
+def open_camera(camera, settings: CameraSettings | None = None) -> cv.VideoCapture:
+    """优先 V4L2 打开摄像头，避免 GStreamer 管道卡住。"""
+    settings = settings or CameraSettings()
+    if isinstance(camera, int):
+        cap = cv.VideoCapture(camera, cv.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv.VideoCapture(camera)
+    else:
+        device = str(camera)
+        cap = cv.VideoCapture(device, cv.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv.VideoCapture(device)
+    if cap.isOpened():
+        cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+        configure_camera(cap, settings)
+    return cap
+
+
+def resolve_port(port: str) -> str:
+    if sys.platform == "win32":
+        return port
+    upper = port.upper()
+    if upper.startswith("COM") and upper[3:].isdigit():
+        return f"/dev/ttyS{int(upper[3:]) - 1}"
+    return port
+
+
+def build_velocity_change(fwd: float, yaw: float) -> bytes:
+    body = {
+        "id": 0,
+        "autorun": 1,
+        "training_set": 0,
+        "training_program": int(TrainingProgram.ISOKINETIC),
+        ROBOT_KEY: {
+            "velo_fwd": fwd,
+            "velo_yaw": yaw,
+        },
+    }
+    payload = json.dumps(body, separators=(",", ":")).encode("utf-8") + b"\x00"
+    frame = build_ctrl(CmdCtrl.TRAINING_CHANGE, payload)
+    if not verify_frame(frame):
+        raise RuntimeError("built velocity frame failed verification")
+    return frame
+
+
+class NavLink:
+    def __init__(self, port: str, baud: int) -> None:
+        self._port = resolve_port(port)
+        self._baud = baud
+        self._ser = None
+
+    def open(self) -> None:
+        self._ser = serial.Serial(self._port, baudrate=self._baud, timeout=0.05)
+        self._ser.reset_input_buffer()
+        print(f"串口 {self._port} @ {self._baud}")
+
+    def _send(self, frame: bytes) -> None:
+        if self._ser is None:
+            raise RuntimeError("serial not open")
+        self._ser.write(frame)
+        self._ser.flush()
+
+    def setup(self) -> None:
+        self._send(build_training_init())
+        time.sleep(0.2)
+        self._send(build_training_start())
+        time.sleep(0.2)
+
+    def teardown(self) -> None:
+        try:
+            self._send(build_training_stop())
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        self._send(build_velocity_change(0.0, 0.0))
+
+    def move(self, fwd: float, yaw: float) -> None:
+        self._send(build_velocity_change(fwd, yaw))
+
+    @property
+    def serial(self):
+        """与 OdomEstimator 共用同一串口（只写 move / 只读反馈）。"""
+        return self._ser
+
+    def close(self) -> None:
+        if self._ser is not None:
+            try:
+                self.stop()
+            except Exception:
+                pass
+            self._ser.close()
+            self._ser = None
+
+
+def ensure_display() -> None:
+    """SSH 会话未继承 DISPLAY 时，默认连本机 :0 以便弹窗。"""
+    if sys.platform == "win32":
+        return
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0"
+        print("DISPLAY 未设置，已自动设为 :0")
 
 # ── 巡线 PID（文件顶部，改这里）────────────────────────────
 # 量级：|lat|=30px → |P|≈0.09；调参看 OSD sat=N（饱和说明 demand 仍超 MAX_YAW）。

@@ -15,5 +15,10 @@ wheels/
 yolo/wheels/
 yolo/preview.jpg
 
+# Runtime artifacts
+logs/
+data/
+
 # Local IDE
 .cursor/
+.vscode/

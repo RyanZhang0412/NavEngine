@@ -46,9 +46,9 @@ DEFAULT_WB_TEMP = 4800
 
 @dataclass(frozen=True)
 class CameraSettings:
-    """固定摄像头成像参数，避免采集与巡线成像不一致。"""
+    """摄像头成像参数。默认 auto=True（与 follow_line_yolo_2 --auto-exposure 一致）。"""
 
-    lock: bool = True
+    auto: bool = True
     exposure: float = DEFAULT_EXPOSURE
     gain: float = DEFAULT_GAIN
     wb_temperature: float = DEFAULT_WB_TEMP
@@ -58,16 +58,18 @@ class CameraSettings:
 
 
 def configure_camera(cap: cv.VideoCapture, settings: CameraSettings) -> None:
-    """锁定曝光与白平衡。本机 USB Camera 经 V4L2/OpenCV 实测可用。"""
-    if not settings.lock:
-        return
-
-    cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 1)
-    cap.set(cv.CAP_PROP_EXPOSURE, settings.exposure)
-    cap.set(cv.CAP_PROP_GAIN, settings.gain)
-
-    cap.set(cv.CAP_PROP_AUTO_WB, 0)
-    cap.set(cv.CAP_PROP_WB_TEMPERATURE, settings.wb_temperature)
+    """配置曝光与白平衡。本机 USB Camera 经 V4L2/OpenCV 实测可用。"""
+    if settings.auto:
+        # 自动曝光：V4L2 常见值为 3；部分 UVC 驱动用 0.75
+        if not cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 3):
+            cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 0.75)
+        cap.set(cv.CAP_PROP_AUTO_WB, 1)
+    else:
+        cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 1)
+        cap.set(cv.CAP_PROP_EXPOSURE, settings.exposure)
+        cap.set(cv.CAP_PROP_GAIN, settings.gain)
+        cap.set(cv.CAP_PROP_AUTO_WB, 0)
+        cap.set(cv.CAP_PROP_WB_TEMPERATURE, settings.wb_temperature)
 
     for prop, value in (
         (cv.CAP_PROP_BRIGHTNESS, settings.brightness),
@@ -85,9 +87,10 @@ def configure_camera(cap: cv.VideoCapture, settings: CameraSettings) -> None:
     gain = cap.get(cv.CAP_PROP_GAIN)
     awb = cap.get(cv.CAP_PROP_AUTO_WB)
     wb = cap.get(cv.CAP_PROP_WB_TEMPERATURE)
+    mode = "自动曝光" if settings.auto else "手动锁定"
     print(
-        f"摄像头固定参数: 手动曝光 ae={ae:.0f} exp={exp:.0f} gain={gain:.0f} | "
-        f"固定白平衡 awb={awb:.0f} temp={wb:.0f}K"
+        f"摄像头参数({mode}): ae={ae:.0f} exp={exp:.0f} gain={gain:.0f} | "
+        f"awb={awb:.0f} temp={wb:.0f}K"
     )
 
 
@@ -263,9 +266,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     p.add_argument("--max", type=int, default=0, help="stop after N images (0 = unlimited)")
     p.add_argument(
-        "--no-lock",
+        "--lock",
         action="store_true",
-        help="do not lock exposure/WB (default matches follow_line)",
+        help="固定曝光/白平衡（默认自动曝光，与 follow_line_2 --auto-exposure 一致）",
+    )
+    p.add_argument(
+        "--exposure",
+        type=float,
+        default=None,
+        help=f"手动曝光值（默认 {DEFAULT_EXPOSURE}；仅 --lock 时生效）",
     )
     p.add_argument(
         "--flip",
@@ -394,7 +403,10 @@ def main(argv: list[str] | None = None) -> int:
 
     interval = 1.0 / args.fps
     session_dir = _make_session_dir(Path(args.output))
-    settings = CameraSettings(lock=not args.no_lock)
+    settings = CameraSettings(
+        auto=not args.lock,
+        exposure=args.exposure if args.exposure is not None else DEFAULT_EXPOSURE,
+    )
 
     use_url = bool(args.url.strip())
     cap: cv.VideoCapture | None = None

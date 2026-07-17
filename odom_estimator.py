@@ -18,7 +18,7 @@
 
 只在 FOLLOW 且 segment 已 begin 时累积；TURN/PAUSE/BLOCKED 不累积。
 
-与 NavLink 共用一个串口: NavLink 只写，本模块只读，互不干扰。
+与 NavLink 共用一个串口（默认 /dev/ttyCH341USB0）：NavLink 写 init/运动，本模块读反馈 JSON。
 用法见文件末尾 demo，或被 follow_line_yolo_2.py 导入。
 """
 from __future__ import annotations
@@ -225,19 +225,30 @@ class OdomEstimator:
     def _rx_loop(self) -> None:
         assert self._ser is not None
         while self._running:
-            try:
-                waiting = self._ser.in_waiting
-            except Exception:
-                time.sleep(0.01)
-                continue
-            if waiting:
-                chunk = self._ser.read(waiting)
-            else:
-                chunk = self._ser.read(1)
-            if chunk:
-                self._parser.feed(chunk)
-            elif not waiting:
-                time.sleep(0.005)
+            self.poll_serial()
+            time.sleep(0.01)
+
+    def poll_serial(self) -> None:
+        """非阻塞读取串口可用字节并喂给解析器（供主循环每帧调用）。
+
+        实现要点（Jetson + CH341 踩坑记录）：
+        - 绝不调用 in_waiting：它是持有 GIL 的 ioctl，CH341 驱动异常时会在
+          内核阻塞，冻结整个解释器（包括其他串口的读线程）。
+        - 改用 timeout=0 的非阻塞 read：pyserial 内部走 select()，会正常
+          释放 GIL，驱动异常时只会返回空数据，不会卡死。
+        - 因此 odom 不再开后台读线程（start() 保留但主程序不再调用），
+          由 follow 主循环在 on_timer 里调用本方法。
+        """
+        if self._ser is None:
+            return
+        try:
+            if self._ser.timeout != 0:
+                self._ser.timeout = 0
+            chunk = self._ser.read(4096)
+        except Exception:
+            return
+        if chunk:
+            self._parser.feed(chunk)
 
     def _on_frame(self, msg: ProtocolMessage) -> None:
         if msg.cmd_type != CmdType.DATA:

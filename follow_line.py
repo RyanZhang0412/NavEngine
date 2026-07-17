@@ -172,6 +172,11 @@ class NavLink:
     def move(self, fwd: float, yaw: float) -> None:
         self._send(build_velocity_change(fwd, yaw))
 
+    @property
+    def serial(self):
+        """与 OdomEstimator 共用同一串口（只写 move / 只读反馈）。"""
+        return self._ser
+
     def close(self) -> None:
         if self._ser is not None:
             try:
@@ -210,8 +215,11 @@ class LineDetectPoly:
         self.max_angular = 0.03
 
         # Centerline tracking params
-        self.lookahead_y_ratio = 0.65
+        self.near_y_ratio = 0.82
+        self.far_y_ratio = 0.28
+        self.lookahead_y_ratio = 0.65  # 局部拟合参考高度
         self.kp_track = 0.03
+        self.ka_track = 0.02
         self.kd_track = 0.03
         self.curvature_gain = 0.5
         self.min_pixels = 90
@@ -406,39 +414,48 @@ class LineDetectPoly:
         if y_max - y_min < 30:
             return None
 
-        look_ratio = float(np.clip(self.lookahead_y_ratio, 0.45, 0.9))
-        y_look = y_min + look_ratio * (y_max - y_min)
-        x_look = float(np.interp(y_look, ys, xs))
+        near_ratio = float(np.clip(self.near_y_ratio, 0.45, 0.95))
+        far_ratio = float(np.clip(self.far_y_ratio, 0.05, 0.55))
+        y_near = y_min + near_ratio * (y_max - y_min)
+        y_far = y_min + far_ratio * (y_max - y_min)
+        x_near = float(np.interp(y_near, ys, xs))
+        x_far = float(np.interp(y_far, ys, xs))
         center_x = img_w / 2.0
-        error = x_look - center_x
+        lateral = x_near - center_x
+        heading = x_near - x_far
 
-        if abs(error) < self.center_deadband_px:
-            error = 0.0
+        if abs(lateral) < self.center_deadband_px:
+            lateral = 0.0
 
         now = time.perf_counter()
-        if self.last_ctrl_time is None:
+        first = self.last_ctrl_time is None
+        if first:
             dt = 0.03
         else:
             dt = max(1e-3, now - self.last_ctrl_time)
         self.last_ctrl_time = now
 
-        d_error = (error - self.prev_error) / dt
-        self.prev_error = error
+        if first:
+            self.prev_error = lateral
+        d_lateral = (lateral - self.prev_error) / dt
+        self.prev_error = lateral
 
         dx_dy = np.gradient(xs, ys)
         d2x_dy2 = np.gradient(dx_dy, ys)
-        look_idx = int(np.argmin(np.abs(ys - y_look)))
-        dy = float(dx_dy[look_idx])
-        ddy = float(d2x_dy2[look_idx])
+        near_idx = int(np.argmin(np.abs(ys - y_near)))
+        dy = float(dx_dy[near_idx])
+        ddy = float(d2x_dy2[near_idx])
         curvature = abs(ddy) / ((1.0 + dy * dy) ** 1.5 + 1e-6)
 
-        sign = -1.0 if error >= 0 else 1.0
-        omega = -(self.kp_track * error + self.kd_track * d_error) + sign * self.curvature_gain * curvature
+        sign = -1.0 if lateral >= 0 else 1.0
+        omega = -(
+            self.kp_track * lateral + self.kd_track * d_lateral
+        ) + self.ka_track * heading + sign * self.curvature_gain * curvature
 
         omega = float(np.clip(omega, -self.max_angular, self.max_angular))
         omega = 0.75 * self.last_angular + 0.25 * omega
         self.last_angular = omega
-        return omega, x_look, y_look, curvature, y_min, y_max
+        return omega, x_near, y_near, x_far, y_far, curvature, y_min, y_max
 
     def _start_recovery(self):
         self.recovering_line = True
@@ -530,10 +547,11 @@ class LineDetectPoly:
                             self.recover_line()
                         return rgb_img, lane_mask
 
-                    omega, x_look, y_look, curv, y_min, y_max = ctrl
+                    omega, x_near, y_near, x_far, y_far, curv, y_min, y_max = ctrl
                     if self.recovering_line:
                         self._stop_recovery()
-                    cv.circle(rgb_img, (int(x_look), int(y_look)), 6, (0, 0, 255), -1)
+                    cv.circle(rgb_img, (int(x_near), int(y_near)), 6, (0, 255, 0), -1)
+                    cv.circle(rgb_img, (int(x_far), int(y_far)), 6, (255, 128, 0), -1)
                     cv.putText(rgb_img, f"curv:{curv:.4f}", (30, 55), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1)
                     cv.putText(rgb_img, f"omega:{omega:.2f}", (30, 80), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1)
                     cv.putText(rgb_img, f"state:{self.Track_state}", (30, 105), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1)

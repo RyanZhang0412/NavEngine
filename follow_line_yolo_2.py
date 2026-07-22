@@ -311,17 +311,17 @@ def ensure_display() -> None:
 # ── 巡线旋钮（只改 FollowCfg）──────────────────────────────────
 @dataclass(frozen=True)
 class FollowCfg:
-    linear: float = 0.4         # 直道线速度
-    max_yaw: float = 0.6         # 巡线角速度上限
-    turn_yaw: float = 0.4        # TURN 原地掉头角速度（勿绑 max_yaw，掉头太快易打滑）
-    kp: float = 0.0015
-    ka: float = 0.001           # A 项基础增益（向后兼容：未提供 ka_straight/ka_curve 时用此值）
+    linear: float = 0.4         # 直道线速度 (m/s)，FOLLOW/TURN 共用上限
+    max_yaw: float = 0.6        # 巡线角速度上限 (rad/s)，yaw_demand 的硬限幅 + 爬坡目标
+    turn_yaw: float = 0.4       # TURN 原地掉头角速度 (rad/s)，独立于 max_yaw
+    kp: float = 0.0015          # P 项增益：横向误差 lat(px) → 角速度 (rad/s)
+    ka: float = 0.001           # A 项基础增益（向后兼容：ka_straight/ka_curve<0 时回退到此值）
     ka_straight: float = -1.0   # A 项直道/出弯增益（curve_w→0 生效，<0 时回退到 ka）
     ka_curve: float = -1.0      # A 项弯中增益（curve_w→1 生效，<0 时回退到 ka）
-    kd: float = 0.0028           # D 项增益
-    kff: float = 1.1              # 曲率前馈增益：ω_ff = kff × κ(1/m) × v(m/s)。从 0.5 起步调
-    curve_slow: float = 0.25      # 弯里最低线速度 = linear × curve_slow
-    yaw_ramp_sec: float = 0.2    # 角速度从 0 爬满目标的秒数（巡线 + TURN 共用）
+    kd: float = 0.0028          # D 项增益：横向误差变化率 d_lat(px/s) → 角速度 (rad/s)
+    kff: float = 1.1            # 曲率前馈增益：ω_ff = kff × κ(1/m) × v(m/s)
+    curve_slow: float = 0.25    # 弯里最低线速度 = linear × curve_slow
+    yaw_ramp_sec: float = 0.2   # 角速度从 0 爬满目标的秒数（巡线 + TURN 共用）
 
 
 CFG = FollowCfg()
@@ -342,92 +342,81 @@ CFG = FollowCfg()
 @dataclass(frozen=True)
 class _Internals:
     # ── 滤波（换帧率量级才动）──────────────────────────────────
-    lat_smooth: float = 0.5
-    yaw_smooth: float = 0.55     # 稍滤 D 尖峰，仍比原 0.65 快
-    head_smooth: float = 0.5     # head 进 A 项前的 EMA（裸 head σ≈28px，放大 ka 后直道会抖）
-    fwd_scale_smooth: float = 0.65
-    steer_dt_max: float = 0.2
-    d_lat_max: float = 25.0      # D 单项上限（原40：直道 D 饱和 0.16 远大于 P 0.033 导致左右飘；降到25 让 P 能主导）
+    # EMA 系数均为"新值权重"，0=不更新、1=不滤波。
+    lat_smooth: float = 0.5     # lat（横向误差）EMA 系数
+    yaw_smooth: float = 0.55    # yaw 输出 EMA 系数（在限幅/爬坡之后）
+    head_smooth: float = 0.5    # head（航向）EMA 系数，进 A 项前滤波
+    fwd_scale_smooth: float = 0.65  # 降速系数 EMA 系数（降速通道，越小越跟手）
+    steer_dt_max: float = 0.2   # dt 上限(s)，超出视为控制中断、重置滤波初值
+    d_lat_max: float = 25.0     # D 项输入 d_lat 限幅 (px/s)
 
     # ── 几何标定（换摄像头/机械结构才动）──────────────────────
-    cam_offset: float = -28
-    near_y: float = 0.8          # 横向控制采样（0=远端顶部，1=近端脚下）
-    far_y: float = 0.2           # 航向基准远端
-    local_fit_halfwin: int = 70
-    local_fit_min_points: int = 5
-    local_fit_y_ratio: float = 0.28  # 局部拟合锚点（越小越往前看）
-    local_fit_extend_px: float = 40.0  # 拟合线段上下端外推长度（px），用于画更长/采样更稳
+    cam_offset: float = -28     # 摄像头中心相对车体中线的横向偏移(px)，正值=线视觉偏右
+    near_y: float = 0.8         # P 项/曲率采样点纵向位置(0=图像顶部远处, 1=底部脚下)
+    far_y: float = 0.2          # 航向远端锚点纵向位置(0=顶,1=底)，与 near_y 做差得 head
+    local_fit_halfwin: int = 70 # 中心线局部拟合窗口半宽(px)，围绕 y_ref 上下取点
+    local_fit_min_points: int = 5  # 局部拟合最少点数，不足则回退到全域拟合
+    local_fit_y_ratio: float = 0.28  # 局部拟合锚点 y_ref 在 y_min~y_max 中的比例(越小越靠前)
+    local_fit_extend_px: float = 40.0  # 拟合线段两端外推长度(px)，扩展可视化/采样范围
 
     # ── 曲率（κ 处理）──────────────────────────────────────────
-    # kappa_abs_max：原始 κ EMA 前的硬限幅；kappa_cap_max：限速/FF 用的上限。
-    # 真弯 κ 在 2.3~4.5/m，回摆污染会抬到 6~8；abs_max=8 形同虚设，cap_max=5 才是有效闸。
-    kappa_w_lo: float = 1.0           # |κf|(1/m) 达此值弯道权重开始 >0（偏航斜视噪声 ≤1.0）
-    kappa_w_hi: float = 2.5           # |κf| 达此值弯道权重=1（真弯 2.3~4.5/m）
-    kappa_abs_max: float = 8.0        # κ 原始值硬限幅（1/m），先限幅再 EMA
-    kappa_cap_max: float = 5.0        # 限速用 κ 上限：回摆污染可把 κf 抬到 6~8，别信
-    kappa_vcap_margin: float = 0.85   # 曲率限速余量：v ≤ margin×max_yaw/|κ|，防转向饱和过冲
-    vcap_floor_frac: float = 0.5      # 曲率限速下限 = frac×linear（原0.2太慢，弯道一顿一顿；0.3 让最低速提到0.18m/s，更丝滑）
+    # κ 处理链：原始 κ → abs_max 硬限幅 → 非对称 EMA → 得 κf。
+    # κf 用于前馈 FF、曲率限速、curve_w 三处。
+    kappa_w_lo: float = 1.0     # |κf|(1/m) 达此值时 curve_w 开始 >0
+    kappa_w_hi: float = 2.5     # |κf| 达此值时 curve_w=1
+    kappa_abs_max: float = 8.0  # 原始 κ 硬限幅(1/m)，EMA 前生效
+    kappa_cap_max: float = 5.0  # 限速用 κ 上限(1/m)，避免极端 κf 把 v_cap 压过低
+    kappa_vcap_margin: float = 0.85  # 曲率限速余量：v_cap = margin × max_yaw / |κ|
+    vcap_floor_frac: float = 0.5  # 曲率限速下限系数，v_cap ≥ frac × linear
 
-    # ── 弯道转向衰减（补丁家族，待重构）────────────────────────
-    # ⚠️ 以下三组（FF 退场 / P 衰减 / 大偏差限速）都是围着"κ 不可信"打补丁。
-    #    病根在 κ 拟合质量，不在这里。验证 κ 限幅收紧后可逐步删减。
-    ff_max_frac: float = 0.5          # FF 幅值上限 = frac×max_yaw，给 P 留回线余量
-    ff_lat_fade_lo: float = 60.0      # |lat_f| 超过此值 FF 开始退场（κ 不可信）
-    # 17:36 日志教训：原 80 太宽，lat<80 时 FF 全额，把车从线上推过去（84~86% lat 0→+30）。
-    # 改 30：FF 在车快到线时就退场，给 P 留主导。ff_lat_fade_hi 也对应收紧。
-    ff_lat_fade_hi: float = 160.0     # |lat_f| 达到此值 FF 完全归零
-    ff_head_fade_lo: float = 10.0     # head 与 FF 反号时：|head| 超过此值 FF 开始退场
-    ff_head_fade_hi: float = 40.0     # head 与 FF 反号时：|head| 达到此值 FF 归零（弯末反打抑制）
-    # FF 收敛退场：lat 正在快速回归（车头已转够）时，FF 别再加码，防出弯过冲。
-    # ff_converge_dlat: |d_lateral| 达到此值（px/s）FF 收敛退场满弓；10fps 下 lat 每帧变 5px → d_lat≈50
-    # ff_converge_atten: 收敛时 FF 最多削到此比例（0.0=完全归零，0.3=保留30%）
-    ff_converge_dlat: float = 60.0
-    ff_converge_atten: float = 1.0
-    # A 项（航向）lat 门限衰减：head 在 |lat| 大时失效（near 点看不到线，head 退化成残线角度），
-    # 继续用会把 P 的修正抵消光，车冲出去就修不回。lat 超过 start 开始压，到 zero 压到 0。
-    a_lat_fade_start: float = 60.0    # |lat_f| 超过此值 A 项开始线性衰减
-    a_lat_fade_zero: float = 150.0    # |lat_f| 达到此值 A 项完全归零（让 P 单独修）
-    p_curve_atten: float = 0.5   # 回退：0.85 掐 P 太狠导致直道抖。0.5 只做温和对抗抑制
-    p_curve_atten_lat_only: float = 0.35  # 仅 lat 维度触发（弯道未确认）时更保守
-    p_curve_start_px: float = 60.0   # 回退到 60：40 触发面太宽，直道瞬态误伤
-    p_curve_confirm: int = 3        # head 维度连续确认帧数，确认后才允许 lat 维度满弓
-    lat_slow_start: float = 60.0      # |lat_f| 超过此值开始大偏差限速
-    lat_slow_hi: float = 120.0        # |lat_f| 达到此值限速到 lat_slow_frac
-    lat_slow_frac: float = 0.55       # 大偏差限速下限 = frac×linear
+    # ── 弯道转向衰减（FF 退场 / P 衰减 / A 项衰减 / 大偏差限速）──
+    ff_max_frac: float = 0.5    # FF 幅值上限 = frac × max_yaw
+    ff_lat_fade_lo: float = 60.0  # |lat_f| 超过此值 FF 开始线性退场
+    ff_lat_fade_hi: float = 160.0  # |lat_f| 达到此值 FF 完全归零
+    ff_head_fade_lo: float = 10.0  # head 与 FF 反号时：|head| 超过此值 FF 开始退场
+    ff_head_fade_hi: float = 40.0  # head 与 FF 反号时：|head| 达到此值 FF 归零
+    ff_converge_dlat: float = 60.0  # 收敛退场：|d_lateral|(px/s) 达此值时 FF 退场满弓
+    ff_converge_atten: float = 1.0  # 收敛退场最大衰减比例(0=完全归零, 1=全额退场)
+    a_lat_fade_start: float = 60.0  # |lat_f| 超过此值 A 项开始线性衰减
+    a_lat_fade_zero: float = 150.0  # |lat_f| 达到此值 A 项完全归零
+    p_curve_atten: float = 0.5     # 弯内 P/A 反向且确认后，P 项最大衰减比例
+    p_curve_atten_lat_only: float = 0.35  # 弯道未确认时(lat 维度单独触发)的衰减上限
+    p_curve_start_px: float = 60.0  # P 衰减触发的 |head| 门槛(px)
+    p_curve_confirm: int = 3       # head 维度连续确认帧数，确认后才允许 lat 维度满弓
+    lat_slow_start: float = 60.0   # |lat_f| 超过此值开始大偏差限速
+    lat_slow_hi: float = 120.0     # |lat_f| 达到此值时限速到 lat_slow_frac
+    lat_slow_frac: float = 0.55    # 大偏差限速系数，fwd ≥ frac × linear
 
     # ── 速度爬升 ──────────────────────────────────────────────
-    fwd_up_sec: float = 1.2           # fwd 从 0 爬回 linear 所需秒数（降速无限制）
+    fwd_up_sec: float = 1.2     # fwd 从 0 爬回 linear 所需秒数(降速无限制，仅限制上升)
 
-    # ── 反光保持（反光场地才触发，平时零触发）──────────────────
-    track_warmup: int = 12
-    jump_lat_px: float = 42.0
-    jump_mask_ratio: float = 0.35
-    hold_max_frames: int = 4
-    track_frame_gap_sec: float = 0.50   # 放宽：9fps 下偶发 250ms 不再误判 gap（原 0.250）
+    # ── 反光保持（反光场地才触发）──────────────────────────────
+    track_warmup: int = 12      # 预热帧数，未达则直接采信本帧(不进 HOLD 逻辑)
+    jump_lat_px: float = 42.0   # lat 跳变阈值(px)，配合 jump_mask_ratio 判反光
+    jump_mask_ratio: float = 0.35  # mask 面积相对跳变阈值，超过则疑反光
+    hold_max_frames: int = 4    # HOLD 最长帧数，达上限强制释放
+    track_frame_gap_sec: float = 0.50  # 相邻有效帧最大间隔(s)，超过视为 gap、重置 HOLD
 
     # ── 状态机行为（各管一个离散行为，互不耦合）────────────────
-    lost_frames: int = 6
-    pause_hold_sec: float = 2
-    pause_recover_frames: int = 3
-    block_recover_fwd_sec: float = 0.8
-    ready_confirm: int = 3
-    turn_capture_lat: float = 180
-    turn_min_line_height: float = 50
-    turn_min_aspect: float = 0.8
-    turn_capture_box_cx_max: float = 90.0  # TURN 捕获额外条件：检测框水平中心离画面中线 < 此值(px)
-    line_side_hysteresis: float = 20.0
-    lat_deadband_px: float = 2.0    # 原 10.0 太大，中心死区导致直道不跟线来回漂
-    follow_roi_top: float = 0.3     # FOLLOW 时去掉图像顶部比例（保留下半 1-top）
-    min_mask_px: int = 3500          # mask 像素低于此值视为线尾残片，拒绝拟合（防 lat/κ 被残片带偏）
-    # 段刚起步保护：里程 < 此值时丢线不进「里程不足 BLOCKED」。
-    early_seg_protect_m: float = 1.0
-    # 超声波避障（滑动窗口计数）：
-    # 模块约 2Hz，腿/窄物体会产生"障碍-无回波-障碍"交替，连续帧计数攒不到。
-    # 改成最近 us_window 帧里有 us_obstacle_confirm 次命中就触发，容忍偶尔无回波。
-    us_obstacle_cm: float = 85.0
-    us_window: int = 5              # 滑动窗口大小（帧）；5 帧 ≈ 0.5s @ 10fps
-    us_obstacle_confirm: int = 2    # 窗口内命中此帧数即触发（旧连续 5 太严，撞人才触发）
-    us_clear_confirm: int = 5
+    lost_frames: int = 6        # 连续丢线多少帧后判定线尾/障碍
+    pause_hold_sec: float = 2   # PAUSE 停留秒数，过后进 TURN
+    pause_recover_frames: int = 3  # PAUSE→FOLLOW 后连续认到线的帧数
+    block_recover_fwd_sec: float = 0.8  # BLOCKED/PAUSE 恢复 + TURN 捕获后，线速度从 0 爬回满速的秒数
+    ready_confirm: int = 3      # TURN 捕获条件连续满足多少帧才切 FOLLOW
+    turn_capture_lat: float = 180  # TURN 捕获：横向误差绝对值上限(px)
+    turn_min_line_height: float = 50  # TURN 捕获：检测框最低高度(px)
+    turn_min_aspect: float = 0.8  # TURN 捕获：检测框高/宽比下限
+    turn_capture_box_cx_max: float = 90.0  # TURN 捕获：检测框水平中心离画面中线最大距离(px)
+    line_side_hysteresis: float = 20.0  # 切换"线在左/右"的迟滞量(px)
+    lat_deadband_px: float = 2.0  # lat 死区(px)，小于此值视为 0
+    follow_roi_top: float = 0.3  # FOLLOW 时去掉图像顶部比例(0~1)，保留下半 1-top
+    min_mask_px: int = 3500     # mask 像素低于此值视为线尾残片，拒绝拟合
+    early_seg_protect_m: float = 1.0  # 段里程(m)低于此值时丢线不判"里程不足 BLOCKED"
+    # ── 超声波避障（滑动窗口计数）──────────────────────────────
+    us_obstacle_cm: float = 85.0  # 障碍触发距离阈值(cm)
+    us_window: int = 5          # 滑动窗口大小(帧)
+    us_obstacle_confirm: int = 2  # 窗口内命中此帧数即触发 BLOCKED
+    us_clear_confirm: int = 5   # 连续多少帧无障碍才退出 BLOCKED
 
 
 _I = _Internals()
@@ -493,29 +482,30 @@ def _hold_stable_lat_px() -> float:
 
 def _curve_fwd_scale(yaw_demand: float, heading_px: float, lat_f: float = 0.0,
                      in_curve: bool = False) -> float:
-    """弯道降速系数：看 heading 判断弯道，但偏航(lat 大)导致的 head 不算弯道。
+    """弯道降速系数(0~1)，最终 fwd = linear × fwd_scale。
 
-    原版只看 heading_px，但车偏在中线一侧时线也呈斜向(head 大)，会被误判为深弯
-    而压到地板速，导致偏航后速度太低无法修回。这里引入 lat 修正：lat 大时减小
-    降速幅度，让车能维持速度把偏航修回来。
+    基于 |heading_px| 判断弯道深度：head 反映线条在画面里的斜向程度，
+    |head| 越大说明前方线越斜(弯道越急)，对应降速越多，最低到 curve_slow。
 
-    in_curve=True（κ 确认真弯）时禁用 lat 放宽：真弯里过冲会让 lat 变大，若仍
-    放宽降速会形成正反馈（越冲越快、越快越冲），2026-07-09 16:21 日志实测过冲
-    168px 就是这条链路。
+    lat 修正：head 在车偏到中线一侧时也会变大(偏航≠弯道)，所以 |lat| 大时
+    减小降速幅度，让车维持速度修回线。in_curve=True(κ 确认真弯)时禁用此放宽，
+    避免弯内过冲→lat 变大→提速→更大过冲的正反馈。
+
+    返回值：1.0=不降速；curve_slow=弯道地板。
     """
     _ = yaw_demand
     floor = CFG.curve_slow
     ah = abs(heading_px)
-    head_start = 35.0
-    head_span = 40.0
+    head_start = 35.0     # |head| 低于此值视为直道，不降速
+    head_span = 40.0      # |head| 从 head_start 起算，每 span px 降速从 0 线性到 1
     if ah <= head_start:
         return 1.0
     t = min(1.0, (ah - head_start) / head_span)
-    # 偏航修正：|lat_f| > 30 时开始放宽降速，>80 时基本不降速（偏航≠弯道）
+    # 偏航修正：|lat_f| > 30 时按比例放宽降速，最多把 t 压回 30%。
     alat = abs(lat_f)
     if alat > 30.0 and not in_curve:
         relief = min(1.0, (alat - 30.0) / 50.0)   # 0~1
-        t = t * (1.0 - 0.7 * relief)               # 最多把 t 压回 30%
+        t = t * (1.0 - 0.7 * relief)
     return 1.0 - t * (1.0 - floor)
 
 
@@ -1061,8 +1051,7 @@ class YoloLineFollower:
         d_term = -(CFG.kd * d_lateral)
         # a_term 延后到 curve_w 计算之后（ka 按 curve_w 调度，见下方）
 
-        # κ 滤波：单帧 κ 尖峰噪声大（16:50 日志实测单帧 0.0006→0.007 跳 10 倍），
-        # 先硬限幅再重 EMA（新值权重 0.25），供前馈 FF 与曲率限速共用。
+        # κ 滤波：原始 κ 先硬限幅，再做非对称 EMA，得到 κf 供 FF/限速/curve_w 使用。
         kappa_raw = 0.0
         if track is not None and track.px_per_m > 1.0:
             kappa_raw = track.curvature * track.px_per_m
@@ -1070,33 +1059,28 @@ class YoloLineFollower:
         if first:
             self._kappa_filt = kappa_raw
         else:
-            # 非对称 EMA：κ 幅值增长（入弯）慢进 0.25 防噪声；收缩（出弯）快放 0.5。
-            # 出弯 κf 拖 0.5~1s 不归零是弯末过头的另一半原因（FF 跟着多转）。
+            # 非对称 EMA：幅值增长(入弯)慢进 0.25，收缩(出弯)快放 0.5。
             a_k = 0.5 if abs(kappa_raw) < abs(self._kappa_filt) else 0.25
             self._kappa_filt = (1.0 - a_k) * self._kappa_filt + a_k * kappa_raw
         kappa_f = self._kappa_filt
-        # 连续弯道权重（替代二值死区开关）：|κf| 在 lo→hi 之间线性 0→1。
-        # 17:03 日志教训：硬开关在死区附近穿越一次，FF/限速就整体跳变，
-        # fwd 0.07↔0.39 弹跳、FF -0.27↔0 跳变，弯里"一顿一顿"全是它。
+        # 连续弯道权重 curve_w：|κf| 在 kappa_w_lo→kappa_w_hi 之间线性 0→1。
+        # 用连续值替代二值开关，避免弯道边缘 FF/限速跳变。
         curve_w = float(np.clip(
             (abs(kappa_f) - _I.kappa_w_lo)
             / max(_I.kappa_w_hi - _I.kappa_w_lo, 1e-3), 0.0, 1.0))
         in_curve = curve_w >= 0.5
         self._curve_w = curve_w
 
-        # A 项（航向）按 curve_w 调度：
-        # 出弯瞬间 curve_w→0，κf≈0，此时 head 里没有曲率污染，就是纯航向误差，
-        # 加大增益能主动修 head 残留（出弯 head=-33 拉不回 → lat 飙到 115 的根因）。
-        # 弯中 curve_w→1，head 同时编码前方曲率，FF 已在处理，A 项压低给 FF 让路。
-        # ka_straight/ka_curve <0 时回退到固定 ka（向后兼容旧 params）。
+        # A 项（航向）按 curve_w 调度增益：
+        # - 直道/出弯(curve_w→0)：head 纯航向误差，用 ka_straight
+        # - 弯中(curve_w→1)：head 同时编码前方曲率，压低增益到 ka_curve 给 FF 让路
+        # ka_straight/ka_curve <0 时回退到固定 ka(向后兼容旧 params)。
         ka_s = CFG.ka_straight if CFG.ka_straight >= 0 else CFG.ka
         ka_c = CFG.ka_curve if CFG.ka_curve >= 0 else CFG.ka
         ka_eff = ka_c + (ka_s - ka_c) * (1.0 - curve_w)
         a_term = ka_eff * head_f
-        # lat 大时压 A 项：head = x_near - x_far 在 |lat| 大时失效（near 点已看不到线，
-        # head 退化成残线角度，方向常与 P 相反，把 P 的回线修正抵消光 → 车冲出去修不回）。
-        # 当 |lat| 超过 a_lat_fade_start 线性压 A，到 a_lat_fade_zero 压到 0，让 P 单独修。
-        # 17:36 日志教训：lat=+165 head=+81 时 A=+0.24 把 P=-0.18 抵消，yaw_cmd≈0 车不转。
+        # A 项 lat 衰减：|lat_f| 大时 near 点偏离线，head 退化为残线角度，
+        # 此时线性压 A，从 a_lat_fade_start 到 a_lat_fade_zero 压到 0。
         alat_a = abs(lat_f)
         if alat_a > _I.a_lat_fade_start:
             a_span = max(_I.a_lat_fade_zero - _I.a_lat_fade_start, 1e-3)
@@ -1104,22 +1088,20 @@ class YoloLineFollower:
                 1.0 - (alat_a - _I.a_lat_fade_start) / a_span, 0.0, 1.0))
             a_term *= a_w
 
-        # 弯内 P/A 反向时衰减 P：P 的符号是 −sign(lat_f)，A 的符号是 sign(head)。
-        # P/A 反向 ⟺ sign(lat_f)·sign(head) > 0（lat 与 head 同号）。
-        # 衰减强度同时看 head（弯深）和 |lat_f|（偏航量）：lat 越大，P 越要给 A 让路。
-        # 迟滞：head 维度需连续 p_curve_confirm 帧确认才允许 lat 维度满弓（防 head 噪声
-        # σ≈28px 在直道大偏移瞬态单帧越线误掐 P）。
+        # 弯内 P/A 反向时衰减 P：
+        # P 符号 = −sign(lat_f)，A 符号 = sign(head)，
+        # 反向 ⟺ sign(lat_f)·sign(head) > 0（lat 与 head 同号）。
+        # 衰减强度取 curve_w_head 与 curve_w_lat 的最大值，
+        # head 维度需连续 p_curve_confirm 帧确认，未确认时只用 lat 维度更弱衰减。
         p_sign = 1.0 if lat_f >= 0 else -1.0
         a_sign = 1.0 if heading_px >= 0 else -1.0
         if p_sign * a_sign > 0 and abs(heading_px) > _I.p_curve_start_px:
             curve_w_head = min(1.0, (abs(heading_px) - _I.p_curve_start_px) / 20.0)
             curve_w_lat = min(1.0, max(0.0, (abs(lat_f) - 30.0)) / 50.0)
-            # head 维度连续确认计数
             self._curve_confirm_streak = min(self._curve_confirm_streak + 1, _I.p_curve_confirm)
             if self._curve_confirm_streak >= _I.p_curve_confirm:
                 atten = _I.p_curve_atten * max(curve_w_head, curve_w_lat)
             else:
-                # 弯道未确认：只允许较弱衰减（lat 维度上限封顶），避免直道瞬态误伤
                 atten = _I.p_curve_atten_lat_only * curve_w_head
                 atten = max(atten, _I.p_curve_atten_lat_only * min(curve_w_lat, 0.5))
             p_term = p_term * (1.0 - atten)
@@ -1128,10 +1110,8 @@ class YoloLineFollower:
 
         fwd_scale = _curve_fwd_scale(p_term + d_term + a_term, heading_px, lat_f,
                                      in_curve=in_curve)
-        # 曲率限速融入 scale（EMA 之前，与 head 降速共用平滑通道，不再瞬跳）：
-        # ω = v×κ，要求 v ≤ margin × max_yaw / |κ|，否则转向饱和必过冲。
-        # κ 限幅到 kappa_cap_max（回摆污染会把 κ 抬到 6~8，真弯只有 2.3~4.5），
-        # 限速下限 vcap_floor_frac×linear（不再砸到 0.07 爬行），按 curve_w 连续混合。
+        # 曲率限速：运动学约束 ω = v×κ，要求 v ≤ margin × max_yaw / |κ|。
+        # κ 限幅到 kappa_cap_max，下限 vcap_floor_frac×linear，按 curve_w 连续混合。
         if curve_w > 0.0:
             kap = min(abs(kappa_f), _I.kappa_cap_max)
             v_cap = _I.kappa_vcap_margin * CFG.max_yaw / max(kap, 1e-6)
@@ -1139,43 +1119,38 @@ class YoloLineFollower:
             cap_scale = min(1.0, v_cap / max(CFG.linear, 1e-6))
             cap_scale = 1.0 - curve_w * (1.0 - cap_scale)
             fwd_scale = min(fwd_scale, cap_scale)
-        # 大偏差限速：弯道后半前方线段变直（κ→0、曲率限速释放），但车还挂在线外
-        # 100px+，满速只会斜着滑走（17:15 日志：lat=-127 时 fwd 弹回 0.39，yaw 塌到
-        # 0.02）。|lat| 大时压一个温和上限，让 P 先把车收敛回线。
+        # 大偏差限速：|lat| 大时即使 κ→0，满速也会斜着滑出线，按 |lat| 压一个上限。
         alat_now = abs(lat_f)
         if alat_now > _I.lat_slow_start:
             w_lat = min(1.0, (alat_now - _I.lat_slow_start)
                         / max(_I.lat_slow_hi - _I.lat_slow_start, 1e-3))
             lat_cap = 1.0 - w_lat * (1.0 - _I.lat_slow_frac)
             fwd_scale = min(fwd_scale, lat_cap)
+        # fwd_scale EMA：降速通道(α=0.40)跟手，升速通道(α=fwd_scale_smooth)滞后。
         alpha_slow = float(np.clip(_I.fwd_scale_smooth, 0.0, 0.99))
         alpha = 0.40 if fwd_scale > self._fwd_scale_filt else alpha_slow
         self._fwd_scale_filt = alpha * self._fwd_scale_filt + (1.0 - alpha) * fwd_scale
         fwd = float(np.clip(CFG.linear * self._fwd_scale_filt, _fwd_min(), CFG.linear))
-        # 上升速率限制：降速立即生效（安全），恢复限速按 fwd_up_sec 爬回，
-        # 防 κ 噪声让限速松开/收紧交替造成 0.40↔0.07 弹跳（"一顿一顿"）。
+        # 上升速率限制：降速立即生效，恢复按 fwd_up_sec 爬回，避免限速松紧交替。
         if not first:
             up_step = CFG.linear * dt / max(_I.fwd_up_sec, 1e-3)
             fwd = min(fwd, self._last_fwd + up_step)
         self._last_fwd = fwd
+        # BLOCKED/PAUSE 恢复 + TURN 捕获后，线速度从 0 按比例爬回，防瞬间给油。
         if self._block_recover_t0 is not None:
             t = (time.perf_counter() - self._block_recover_t0) / _I.block_recover_fwd_sec
             if t >= 1.0:
                 self._block_recover_t0 = None
             else:
-                # 从 0 线性爬（原 max(0.25,t) 首帧就 25%×linear，TURN 捕获后易打滑）
                 fwd *= float(np.clip(t, 0.0, 1.0))
 
-        # 曲率前馈：ω_ff = kff × κ(1/m) × v(m/s)。κ 由中心线二次拟合得到（EMA 滤波），
-        # 像素曲率经 px_per_m 换算到 1/m。直道 κ≈0，前馈自然失效；弯道按曲率给足转向。
-        # 三道保险：
-        # 1) 幅值上限 ff_max_frac×max_yaw，给 P 留回线余量，FF 永远不独占转向；
-        # 2) |lat_f| 大时 κ 是斜视线条拟合出来的、不可信，FF 线性退场
-        #    （|lat|≤ff_lat_fade_lo 全额 → ≥ff_lat_fade_hi 归零），把转向让给 P；
-        # 3) 按 curve_w 连续加权，弯道边缘不再 0↔满幅跳变；
-        # 4) 弯末反打抑制：head 与 FF 反号 = 车头已转过线的方向（FF 只看前方线的
-        #    弯度，不知道车已经转够了）。17:33 日志：出弯 head=-33 时 FF 仍 +0.30
-        #    顶着转，车以大角度穿线冲到对侧 +100px，直线上还要往回修。
+        # 曲率前馈：ω_ff = kff × κ(1/m) × v(m/s)，按运动学直接给出跟线所需角速度。
+        # κ 由中心线二次拟合得到(EMA 滤波)，像素曲率经 px_per_m 换算到 1/m。
+        # FF 受四道调节：
+        # 1) 幅值上限 ff_max_frac×max_yaw
+        # 2) |lat_f| 大时线性退场(ff_lat_fade_lo→hi)
+        # 3) 收敛退场：lat×d_lateral<0 时(lat 正在回归)按 |d_lateral| 衰减
+        # 4) head 与 FF 反号时按 |head| 退场(弯末反打抑制)
         ff_term = 0.0
         if curve_w > 0.0 and CFG.kff > 0:
             ff_lim = _I.ff_max_frac * CFG.max_yaw
@@ -1184,29 +1159,24 @@ class YoloLineFollower:
             span = max(_I.ff_lat_fade_hi - _I.ff_lat_fade_lo, 1e-3)
             ff_w = float(np.clip(1.0 - (alat - _I.ff_lat_fade_lo) / span, 0.0, 1.0))
             ff_term *= ff_w * curve_w
-            # 收敛退场：lat 正在快速回归（lat×d_lateral<0）= 车头已转够，FF 别再加码。
-            # 解决"出弯过冲"：FF 因 κf EMA 滞后在车追上弯道后还在满弓推，把车推过线。
-            # 17:54 日志：lat -55→0 收敛 6 帧期间 FF 持续 +0.415，出弯冲到 +135。
             if lat_f * d_lateral < 0:
                 converge_w = float(np.clip(
                     abs(d_lateral) / _I.ff_converge_dlat, 0.0, 1.0))
                 ff_term *= 1.0 - converge_w * _I.ff_converge_atten
             if ff_term * heading_px < 0:
-                # 弯末反打抑制：FF 与 head 反号 = 车头方向（head=near-far）已越过线走向，
-                # FF 按 κf(EMA 滞后)还在同向加码 = 过推，该削。
-                # 符号约定（已用 102745 日志 + 现实右弯校准，含摄像头水平翻转）：
-                #   现实右弯 → flip后画面右弯 → head>0(near比far靠右), kf<0, FF=-kff×kf>0(向右转)
-                #   入弯：FF>0 + head>0 → ff×head>0 → 不削（FF 推车追弯）✓
-                #   弯末：FF>0(κf滞后) + head<0(线视觉反向) → ff×head<0 → 削 ✓
-                # 曾试过 lat×head>0 和 ff×lat<0，都误削入弯/弯中的正常 FF，已回退。
+                # head 与 FF 反号 = 车头方向已越过线走向，FF 按 κf(EMA 滞后)还在同向加码。
+                # 符号约定(摄像头水平翻转 img_flip=True)：
+                #   现实右弯 → 画面右弯 → head>0, kf<0, FF=-kff×kf>0(向右转)
+                #   入弯：FF>0 + head>0 → ff×head>0 → 不削
+                #   弯末：FF>0(κf 滞后) + head<0(线视觉反向) → ff×head<0 → 削
                 hspan = max(_I.ff_head_fade_hi - _I.ff_head_fade_lo, 1e-3)
                 ff_term *= float(np.clip(
                     1.0 - (abs(heading_px) - _I.ff_head_fade_lo) / hspan, 0.0, 1.0))
 
+        # 四项合成 + 硬限幅 + dt 爬坡 + EMA 平滑。
         yaw_demand = p_term + d_term + a_term + ff_term
         yaw_raw = float(np.clip(yaw_demand, -CFG.max_yaw, CFG.max_yaw))
         if not first:
-            # 按 dt 限制角速度斜率，不再假设 30fps（实际 ~10fps）。
             step = CFG.max_yaw * dt / max(CFG.yaw_ramp_sec, 1e-3)
             yaw_raw = float(np.clip(
                 yaw_raw,

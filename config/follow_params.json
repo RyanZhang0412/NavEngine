@@ -2,12 +2,12 @@
   "_说明": [
     "巡线调参文件。_ 开头的键是分组标题/说明，加载时自动跳过。",
     "",
-    "调参优先级：",
+    "调参顺序建议：",
     "  0) 换摄像头/改装位置 → 先标定 几何标定（cam_offset/near_y/far_y/...）",
     "  1) 再调 速度（linear/max_yaw）让车能跑完一圈",
-    "  2) 再调 转向.PID（kp/kd）压住直道偏航",
-    "  3) 再调 转向.前馈（kff/ka_*/curve_slow）治弯道",
-    "  4) 状态机/视觉只在出现对应症状时动",
+    "  2) 再调 转向.PID（kp/kd）",
+    "  3) 再调 转向.前馈（kff/ka_*/curve_slow）",
+    "  4) 状态机/视觉只在出现对应需求时动",
     "",
     "未列出的参数（滤波/曲率衰减/反光保持等设计常数）用代码默认值，",
     "需要时去 follow_line_yolo_2.py 的 _Internals 里改，或把键名加回本文件。"
@@ -15,11 +15,11 @@
 
   "cfg": {
     "_速度": [
-      "linear:      直道线速度 (m/s)",
-      "max_yaw:     巡线角速度上限 (rad/s)，越大弯道越猛但越容易振荡",
-      "turn_yaw:    TURN 原地掉头角速度 (rad/s)，独立于 max_yaw，太大易打滑",
-      "curve_slow:  弯里最低线速度 = linear × curve_slow",
-      "yaw_ramp_sec: yaw 从 0 爬满目标的秒数（巡线+掉头共用）"
+      "linear:       直道线速度 (m/s)，FOLLOW/TURN 共用上限",
+      "max_yaw:      巡线角速度上限 (rad/s)，是 yaw_demand 的硬限幅与爬坡目标",
+      "turn_yaw:     TURN 原地掉头角速度 (rad/s)，独立于 max_yaw",
+      "curve_slow:   基于 head 的弯道最低线速度系数，fwd ≥ linear × curve_slow",
+      "yaw_ramp_sec: 角速度从 0 爬满目标的秒数（巡线 + TURN 共用）"
     ],
     "linear": 0.6,
     "max_yaw": 0.9,
@@ -28,10 +28,11 @@
     "yaw_ramp_sec": 0.2,
 
     "_转向.PID": [
-      "kp:           横向误差 P 增益。lat 越大转得越狠，治直道偏航",
-      "kd:           横向误差 D 增益。压 lat 变化率，防振荡/超调",
-      "ka_straight:  直道/出弯的航向增益,抑制直道歪头（curve_w→0 生效）",
-      "ka_curve:     弯中的航向增益，抑制弯内歪头（curve_w→1 生效，压低给 FF 让路）"
+      "kp:          P 项增益：横向误差 lat(px) → 角速度 (rad/s)，P = -kp × lat",
+      "kd:          D 项增益：横向误差变化率 d_lat(px/s) → 角速度 (rad/s)，D = -kd × d_lat",
+      "ka_straight: 直道/出弯航向增益（curve_w→0 生效），A = ka_eff × head",
+      "ka_curve:    弯中航向增益（curve_w→1 生效），<0 时回退到 ka",
+      "             ka_eff 在 ka_curve→ka_straight 之间按 curve_w 线性插值"
     ],
     "kp": 0.0022,
     "kd": 0.0040,
@@ -39,7 +40,8 @@
     "ka_curve": 0.0009,
 
     "_转向.前馈": [
-      "kff: 曲率前馈增益。弯道按 κ 主动给转向，ω_ff = kff × κ(1/m) × v(m/s)"
+      "kff: 曲率前馈增益。FF = -kff × κ(1/m) × v(m/s)，仅在 curve_w>0 时启用。",
+      "     FF 受幅值上限 ff_max_frac×max_yaw，及 lat/head/收敛三道退场调节。"
     ],
     "kff": 1.4
   },
@@ -47,11 +49,12 @@
   "internals": {
     "_几何标定": [
       "换摄像头/改装位置才动。",
-      "cam_offset:         摄像头中心相对车体中线的横向偏移 (px)，正值线偏右",
-      "near_y/far_y:       控制/航向采样点纵向位置 (0=图像顶部远处, 1=底部脚下)",
-      "local_fit_halfwin:  中心线局部拟合窗口半宽 (px)",
-      "local_fit_min_points: 拟合最少点数，不够则放弃",
-      "local_fit_y_ratio:  局部拟合锚点 (越小越往前看)"
+      "cam_offset:          摄像头中心相对车体中线的横向偏移 (px)，正值=线视觉偏右",
+      "near_y:              P 项/曲率采样点纵向位置 (0=图像顶部远处, 1=底部脚下)",
+      "far_y:               航向远端锚点纵向位置 (0=顶, 1=底)，与 near 做差得 head",
+      "local_fit_halfwin:   中心线局部拟合窗口半宽 (px)",
+      "local_fit_min_points: 局部拟合最少点数，不足则回退全域拟合",
+      "local_fit_y_ratio:   局部拟合锚点 y_ref 在 y_min~y_max 中的比例 (越小越靠前)"
     ],
     "cam_offset": -28.0,
     "near_y": 0.75,
@@ -61,19 +64,19 @@
     "local_fit_y_ratio": 0.28,
 
     "_视觉.检测": [
-      "min_mask_px:   mask 像素低于此值视为线尾残片，拒绝拟合（防 lat/κ 被残片带偏）",
-      "follow_roi_top: FOLLOW 时去掉图像顶部比例 (0~1)，越小保留越多、掩膜越长"
+      "min_mask_px:  mask 像素低于此值视为线尾残片，拒绝拟合",
+      "follow_roi_top: FOLLOW 时去掉图像顶部比例 (0~1)，保留下半 1-top"
     ],
     "min_mask_px": 3500,
     "follow_roi_top": 0.25,
 
     "_状态机.掉头捕获": [
       "TURN 模式从掉头扫描切回 FOLLOW 的条件，全部满足且连续 ready_confirm 帧才捕获。",
-      "turn_capture_lat:      横向误差绝对值低于此值 (px)，说明线已扫到车正前方",
-      "turn_min_line_height:  检测框高度最低要求 (px)",
-      "turn_min_aspect:       检测框高/宽比最低要求（线要竖向才像正前方）",
-      "turn_capture_box_cx_max: 检测框中心离画面中线最大距离 (px)",
-      "ready_confirm:         以上条件连续满足的帧数"
+      "turn_capture_lat:       横向误差绝对值上限 (px)",
+      "turn_min_line_height:   检测框最低高度 (px)",
+      "turn_min_aspect:        检测框高/宽比下限",
+      "turn_capture_box_cx_max: 检测框水平中心离画面中线最大距离 (px)",
+      "ready_confirm:          以上条件连续满足的帧数"
     ],
     "turn_capture_lat": 180.0,
     "turn_min_line_height": 50.0,
@@ -83,40 +86,35 @@
 
     "_状态机.丢线": [
       "lost_frames:   连续丢线多少帧后判定线尾停车（进 PAUSE/BLOCKED）",
-      "pause_hold_sec: PAUSE 状态停留秒数，过后开始掉头"
+      "pause_hold_sec: PAUSE 停留秒数，过后进 TURN"
     ],
     "lost_frames": 6,
     "pause_hold_sec": 2.0,
 
     "_状态机.恢复": [
-      "pause_recover_frames:   PAUSE→FOLLOW 后连续认到线多少帧才恢复正常速度",
-      "block_recover_fwd_sec:  BLOCKED/PAUSE恢复 以及 TURN捕获→FOLLOW 后，",
-      "                        线速度从 0 线性爬回满速的秒数（防瞬间给油打滑）"
+      "pause_recover_frames:  PAUSE→FOLLOW 后连续认到线的帧数",
+      "block_recover_fwd_sec: BLOCKED/PAUSE 恢复 + TURN 捕获后，线速度从 0 爬回满速的秒数"
     ],
     "pause_recover_frames": 3,
     "block_recover_fwd_sec": 1.2,
 
     "_状态机.起步保护": [
-      "early_seg_protect_m: 里程低于此值 (m) 时丢线不判「里程不足 BLOCKED」，",
-      "                      防止刚起步车没动起来就误判进 BLOCKED"
+      "early_seg_protect_m: 段里程 (m) 低于此值时丢线不判「里程不足 BLOCKED」"
     ],
     "early_seg_protect_m": 1.0,
 
     "_状态机.边带": [
-      "line_side_hysteresis: 切换「线在左/右」的迟滞量 (px)，防边界来回跳",
-      "lat_deadband_px:      横向误差死区 (px)，小于此值当 0 处理（防直道微抖）"
+      "line_side_hysteresis: 切换「线在左/右」的迟滞量 (px)",
+      "lat_deadband_px:      横向误差死区 (px)，小于此值当 0 处理"
     ],
     "line_side_hysteresis": 20.0,
     "lat_deadband_px": 2.0,
 
     "_状态机.超声波": [
-      "us_obstacle_cm:     障碍物距离阈值 (cm)，低于此值开始计数",
-      "us_window:          滑动窗口大小 (帧)，约 0.5s @ 10fps",
-      "us_obstacle_confirm: 窗口内命中此帧数即触发 BLOCKED（容忍偶尔无回波）",
-      "us_clear_confirm:   连续 N 帧高于阈值才退出 BLOCKED",
-      "",
-      "注意：超声模块约 2Hz，旧版要求连续 N 帧都障碍根本攒不到，",
-      "撞人了还没停。改成窗口内出现 confirm 次即触发。"
+      "us_obstacle_cm:     障碍触发距离阈值 (cm)",
+      "us_window:          滑动窗口大小 (帧)",
+      "us_obstacle_confirm: 窗口内命中此帧数即触发 BLOCKED",
+      "us_clear_confirm:   连续多少帧无障碍才退出 BLOCKED"
     ],
     "us_obstacle_cm": 75.0,
     "us_window": 5,

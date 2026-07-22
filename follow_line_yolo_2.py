@@ -319,7 +319,7 @@ class FollowCfg:
     ka_straight: float = -1.0   # A 项直道/出弯增益（curve_w→0 生效，<0 时回退到 ka）
     ka_curve: float = -1.0      # A 项弯中增益（curve_w→1 生效，<0 时回退到 ka）
     kd: float = 0.0028           # D 项增益
-    kff: float = 1              # 曲率前馈增益：ω_ff = kff × κ(1/m) × v(m/s)。从 0.5 起步调
+    kff: float = 1.1              # 曲率前馈增益：ω_ff = kff × κ(1/m) × v(m/s)。从 0.5 起步调
     curve_slow: float = 0.25      # 弯里最低线速度 = linear × curve_slow
     yaw_ramp_sec: float = 0.2    # 角速度从 0 爬满目标的秒数（巡线 + TURN 共用）
 
@@ -366,16 +366,16 @@ class _Internals:
     kappa_abs_max: float = 8.0        # κ 原始值硬限幅（1/m），先限幅再 EMA
     kappa_cap_max: float = 5.0        # 限速用 κ 上限：回摆污染可把 κf 抬到 6~8，别信
     kappa_vcap_margin: float = 0.85   # 曲率限速余量：v ≤ margin×max_yaw/|κ|，防转向饱和过冲
-    vcap_floor_frac: float = 0.3      # 曲率限速下限 = frac×linear（原0.2太慢，弯道一顿一顿；0.3 让最低速提到0.18m/s，更丝滑）
+    vcap_floor_frac: float = 0.5      # 曲率限速下限 = frac×linear（原0.2太慢，弯道一顿一顿；0.3 让最低速提到0.18m/s，更丝滑）
 
     # ── 弯道转向衰减（补丁家族，待重构）────────────────────────
     # ⚠️ 以下三组（FF 退场 / P 衰减 / 大偏差限速）都是围着"κ 不可信"打补丁。
     #    病根在 κ 拟合质量，不在这里。验证 κ 限幅收紧后可逐步删减。
     ff_max_frac: float = 0.5          # FF 幅值上限 = frac×max_yaw，给 P 留回线余量
-    ff_lat_fade_lo: float = 30.0      # |lat_f| 超过此值 FF 开始退场（κ 不可信）
+    ff_lat_fade_lo: float = 60.0      # |lat_f| 超过此值 FF 开始退场（κ 不可信）
     # 17:36 日志教训：原 80 太宽，lat<80 时 FF 全额，把车从线上推过去（84~86% lat 0→+30）。
     # 改 30：FF 在车快到线时就退场，给 P 留主导。ff_lat_fade_hi 也对应收紧。
-    ff_lat_fade_hi: float = 120.0     # |lat_f| 达到此值 FF 完全归零
+    ff_lat_fade_hi: float = 160.0     # |lat_f| 达到此值 FF 完全归零
     ff_head_fade_lo: float = 10.0     # head 与 FF 反号时：|head| 超过此值 FF 开始退场
     ff_head_fade_hi: float = 40.0     # head 与 FF 反号时：|head| 达到此值 FF 归零（弯末反打抑制）
     # FF 收敛退场：lat 正在快速回归（车头已转够）时，FF 别再加码，防出弯过冲。

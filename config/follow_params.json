@@ -22,7 +22,7 @@
       "yaw_ramp_sec: yaw 从 0 爬满目标的秒数（巡线+掉头共用）"
     ],
     "linear": 0.6,
-    "max_yaw": 0.83,
+    "max_yaw": 0.9,
     "turn_yaw": 0.4,
     "curve_slow": 0.4,
     "yaw_ramp_sec": 0.2,
@@ -36,12 +36,12 @@
     "kp": 0.0022,
     "kd": 0.0040,
     "ka_straight": 0.003,
-    "ka_curve": 0.0008,
+    "ka_curve": 0.0009,
 
     "_转向.前馈": [
       "kff: 曲率前馈增益。弯道按 κ 主动给转向，ω_ff = kff × κ(1/m) × v(m/s)"
     ],
-    "kff": 1.0
+    "kff": 1.4
   },
 
   "internals": {
@@ -54,9 +54,9 @@
       "local_fit_y_ratio:  局部拟合锚点 (越小越往前看)"
     ],
     "cam_offset": -28.0,
-    "near_y": 0.8,
+    "near_y": 0.75,
     "far_y": 0.2,
-    "local_fit_halfwin": 70,
+    "local_fit_halfwin": 85,
     "local_fit_min_points": 5,
     "local_fit_y_ratio": 0.28,
 

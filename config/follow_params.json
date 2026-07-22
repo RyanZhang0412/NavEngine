@@ -49,7 +49,6 @@
       "换摄像头/改装位置才动。",
       "cam_offset:         摄像头中心相对车体中线的横向偏移 (px)，正值线偏右",
       "near_y/far_y:       控制/航向采样点纵向位置 (0=图像顶部远处, 1=底部脚下)",
-      "lookahead_y:        P 项前瞻点 (0=顶,1=底)，比 near 更前看，提前感知弯道",
       "local_fit_halfwin:  中心线局部拟合窗口半宽 (px)",
       "local_fit_min_points: 拟合最少点数，不够则放弃",
       "local_fit_y_ratio:  局部拟合锚点 (越小越往前看)"
@@ -57,7 +56,6 @@
     "cam_offset": -28.0,
     "near_y": 0.8,
     "far_y": 0.2,
-    "lookahead_y": 0.2,
     "local_fit_halfwin": 70,
     "local_fit_min_points": 5,
     "local_fit_y_ratio": 0.28,

@@ -353,7 +353,6 @@ class _Internals:
     cam_offset: float = -28
     near_y: float = 0.8          # 横向控制采样（0=远端顶部，1=近端脚下）
     far_y: float = 0.2           # 航向基准远端
-    lookahead_y: float = 0.2    # P 项前瞻点（0=顶,1=底）。比 near 更前看，提前感知弯道
     local_fit_halfwin: int = 70
     local_fit_min_points: int = 5
     local_fit_y_ratio: float = 0.28  # 局部拟合锚点（越小越往前看）
@@ -729,7 +728,6 @@ class TrackInfo:
     y_near: float
     x_far: float
     y_far: float
-    x_lookahead: float            # P 项前瞻点 x（lookahead_y 处采样）
     curvature: float              # 中心线在 near 点的曲率 κ（1/px），右弯为正
     px_per_m: float               # 像素→米的纵向尺度（近处线宽标定）
 
@@ -739,10 +737,6 @@ class TrackInfo:
 
     def lateral_px(self, center_x: float) -> float:
         return self.x_near - center_x
-
-    def lateral_lookahead_px(self, center_x: float) -> float:
-        """前瞻横向偏差：用于 P 项，比 near 更早感知弯道。"""
-        return self.x_lookahead - center_x
 
     def turn_capture_ready(self, center_x: float, geom: BoxGeom | None) -> tuple[bool, float, float, float]:
         lat = abs(self.lateral_px(center_x))
@@ -873,7 +867,6 @@ def fit_centerline(mask: np.ndarray) -> TrackInfo | None:
 
     x_near, y_near = _sample_centerline_x(center, _I.near_y)
     x_far, y_far = _sample_centerline_x(center, _I.far_y)
-    x_lookahead, y_lookahead = _sample_centerline_x(center, _I.lookahead_y)
 
     # 曲率（1/px）：在局部中心线上、脚下 y_near 处求值（与改 κ 补丁前一致）。
     # 154204 全域 2a 补丁导致入弯 FF 过早贴顶、侧偏崩到 100~150，已回退。
@@ -888,7 +881,7 @@ def fit_centerline(mask: np.ndarray) -> TrackInfo | None:
     px_per_m = _px_per_m_from_width(width_px)
 
     return TrackInfo(center, left_line, right_line, x_near, y_near, x_far, y_far,
-                     x_lookahead, kappa, px_per_m)
+                     kappa, px_per_m)
 
 
 def draw_track(vis: np.ndarray, track: TrackInfo) -> None:

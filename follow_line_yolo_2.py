@@ -347,7 +347,7 @@ class _Internals:
     head_smooth: float = 0.5     # head 进 A 项前的 EMA（裸 head σ≈28px，放大 ka 后直道会抖）
     fwd_scale_smooth: float = 0.65
     steer_dt_max: float = 0.2
-    d_lat_max: float = 40.0      # D 单项上限
+    d_lat_max: float = 25.0      # D 单项上限（原40：直道 D 饱和 0.16 远大于 P 0.033 导致左右飘；降到25 让 P 能主导）
 
     # ── 几何标定（换摄像头/机械结构才动）──────────────────────
     cam_offset: float = -28
@@ -367,7 +367,7 @@ class _Internals:
     kappa_abs_max: float = 8.0        # κ 原始值硬限幅（1/m），先限幅再 EMA
     kappa_cap_max: float = 5.0        # 限速用 κ 上限：回摆污染可把 κf 抬到 6~8，别信
     kappa_vcap_margin: float = 0.85   # 曲率限速余量：v ≤ margin×max_yaw/|κ|，防转向饱和过冲
-    vcap_floor_frac: float = 0.2      # 曲率限速下限 = frac×linear
+    vcap_floor_frac: float = 0.3      # 曲率限速下限 = frac×linear（原0.2太慢，弯道一顿一顿；0.3 让最低速提到0.18m/s，更丝滑）
 
     # ── 弯道转向衰减（补丁家族，待重构）────────────────────────
     # ⚠️ 以下三组（FF 退场 / P 衰减 / 大偏差限速）都是围着"κ 不可信"打补丁。
